@@ -9,137 +9,108 @@ import torch.nn as nn
 from rocketlanding.models import ActorCritic
 from rocketlanding.memory import RolloutBuffer
 
-# --- Hyperparameters ---
-ENV_NAME = "LunarLanderContinuous-v3"  # The environment
-lr = 1e-4                    # Learning Rate (Standard for PPO)
-gamma = 0.99                 # Discount Factor (How much we care about future rewards)
-K_epochs = 10                 # How many times we update on the same batch of data
-eps_clip = 0.2               # PPO Clipping (Prevents the agent from changing too fast)
-max_timesteps = 5000         # How many steps to collect before updating
-total_timesteps = 1500_000    # Total training duration
-
 def train():
-    # 1. Setup Environment
-    # continuous=True is CRITICAL for rocket throttling (0.0 to 1.0) rather than On/Off
+    # --- Configuration ---
+    ENV_NAME = "LunarLanderContinuous-v3"
+    total_timesteps = 1_000_000
+    max_steps = 2048
+    batch_size = 64
+    K_epochs = 10
+    lr = 3e-4
+    gamma = 0.99
+    gae_lambda = 0.95
+    eps_clip = 0.2
+    entropy_coef = 0.0005
+
+    # Initialize environment (Naked, no observation normalization for now)
     env = gym.make(ENV_NAME)
-    
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-
-    # 2. Setup Agent & Memory
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    policy = ActorCritic(state_dim, action_dim).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
-    buffer = RolloutBuffer()
-    # ... after optimizer = optim.Adam(...) ...
     
-    # Calculate how many update steps we will do in total
-    num_updates = total_timesteps // max_timesteps
-
-    # Decay LR linearly from 100% to 1% over the course of training
-    scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.01, total_iters=num_updates)
-    print(f"Training on {device}...")
-
-    # 3. Main Training Loop
-    time_step = 0
-    i_episode = 0
+    policy = ActorCritic(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
+    optimizer = optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
     
-    while time_step < total_timesteps:
+    current_step = 0
+    while current_step < total_timesteps:
+        # Data storage for current rollout
+        states, raw_actions, logprobs, rewards, dones, values = [], [], [], [], [], []
         state, _ = env.reset()
-        current_ep_reward = 0
-
-        # --- Phase 1: Data Collection (Rollout) ---
-        for t in range(max_timesteps):
-            time_step += 1
+        
+        # --- Data Collection (Rollout) ---
+        for _ in range(max_steps):
+            current_step += 1
+            st_tensor = torch.FloatTensor(state).to(device).unsqueeze(0)
             
-            # Convert state to tensor
-            state_tensor = torch.FloatTensor(state).to(device)
-            
-            # Select action with no gradient (we are just playing, not training yet)
             with torch.no_grad():
-                action, log_prob, _, value = policy.get_action_and_value(state_tensor)
+                action, lp, _, val, raw_act = policy.get_action_and_value(st_tensor)
 
-            # Interact with env
-            action_np = action.cpu().numpy().flatten()
-            next_state, reward, terminated, truncated, _ = env.step(action_np)
+            next_state, reward, term, trunc, _ = env.step(action.cpu().numpy().flatten())
             
-            # Save data to buffer
-            buffer.add(state, action_np, log_prob.cpu().numpy(), reward, terminated)
+            states.append(state)
+            raw_actions.append(raw_act.cpu().numpy().flatten())
+            logprobs.append(lp.cpu().item())
+            rewards.append(reward)
+            dones.append(term)
+            values.append(val.cpu().item())
             
             state = next_state
-            current_ep_reward += reward
+            if term or trunc:
+                state, _ = env.reset()
 
-            # Handle end of episode
-            if terminated or truncated:
-                break
+        # --- GAE Advantage Calculation ---
+        returns, advantages = [], []
+        gae = 0
+        with torch.no_grad():
+            # Bootstrap value of the last state
+            next_val = policy.get_value(torch.FloatTensor(state).to(device)).item()
         
-        # --- Phase 2: Update (Training) ---
-        # We update the network after every "batch" of experience
+        for i in reversed(range(len(rewards))):
+            mask = 1.0 - dones[i]
+            delta = rewards[i] + gamma * next_val * mask - values[i]
+            gae = delta + gamma * gae_lambda * mask * gae
+            advantages.insert(0, gae)
+            next_val = values[i]
+            returns.insert(0, gae + values[i])
+
+        # Convert to Tensors
+        s_ts = torch.FloatTensor(np.array(states)).to(device)
+        ra_ts = torch.FloatTensor(np.array(raw_actions)).to(device)
+        lp_ts = torch.FloatTensor(np.array(logprobs)).to(device)
+        adv_ts = torch.FloatTensor(advantages).to(device)
+        ret_ts = torch.FloatTensor(returns).to(device)
         
-        # Calculate Discounted Rewards (Rewards-to-Go)
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(buffer.rewards), reversed(buffer.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-            
-        # Normalizing rewards helps training stability
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        # Advantage Normalization (Essential for PPO stability)
+        adv_ts = (adv_ts - adv_ts.mean()) / (adv_ts.std() + 1e-8)
 
-        # Convert buffer to tensors
-        old_states = torch.tensor(np.array(buffer.states), dtype=torch.float32).to(device)
-        old_actions = torch.tensor(np.array(buffer.actions), dtype=torch.float32).to(device)
-        old_logprobs = torch.tensor(np.array(buffer.logprobs), dtype=torch.float32).to(device)
-
-        # Optimize policy for K epochs
+        # --- Optimization (Mini-batch SGD) ---
+        indices = np.arange(max_steps)
         for _ in range(K_epochs):
-            # Evaluate old actions and values
-            _, logprobs, entropy, state_values = policy.get_action_and_value(old_states, old_actions)
-            
-            # Calculate ratios (How much did the policy change?)
-            ratios = torch.exp(logprobs - old_logprobs)
-            
-            # Calculate Advantages
-            advantages = rewards - state_values.detach().squeeze()
+            np.random.shuffle(indices)
+            for start in range(0, max_steps, batch_size):
+                idx = indices[start:start+batch_size]
+                
+                _, new_lp, ent, new_v, _ = policy.get_action_and_value(s_ts[idx], ra_ts[idx])
+                
+                ratio = torch.exp(new_lp - lp_ts[idx])
+                surr1 = ratio * adv_ts[idx]
+                surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * adv_ts[idx]
+                
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = nn.MSELoss()(new_v, ret_ts[idx])
+                
+                loss = actor_loss + 0.5 * critic_loss - entropy_coef * ent.mean()
+                
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5) # Gradient clipping
+                optimizer.step()
 
-            # PPO Loss Formula (The "Surrogate" Loss)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages
-            
-            # Final Loss: Maximize Reward - Minimize Value Error + Bonus for Entropy (Exploration)
-            loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values.squeeze(), rewards) - 0.01 * entropy
-            
-            # Gradient Step
-            optimizer.zero_grad()
-            loss.mean().backward()
-            optimizer.step()
-
-        # Clear buffer for next batch
-        buffer.clear()
-        
-        scheduler.step()
-        # Logging
-        i_episode += 1
-        if i_episode % 10 == 0:
-            print(f"Episode: {i_episode} \t Timestep: {time_step} \t Reward: {current_ep_reward:.2f}")
+        # --- Progress Monitoring ---
+        current_std = torch.exp(torch.clamp(policy.actor_logstd, -2, 1)).detach().cpu().numpy()
+        print(f"Step: {current_step} | Mean Reward: {np.mean(rewards):.2f} | Std: {current_std[0]}")
 
         # Save Checkpoint
-        if i_episode % 1000 == 0:
-            torch.save(policy.state_dict(), f"ppo_rocket_{i_episode}.pth")
-     # ... [Existing while loop code above] ...
-
-    # --- SAVE FINAL MODEL ---
-    final_path = "ppo_rocket_final.pth"
-    torch.save(policy.state_dict(), final_path)
-    print("-------------------------------------------------")
-    print(f"Training finished! Final model saved to: {final_path}")
-    print("-------------------------------------------------")
-
-    
-if __name__ == '__main__':
-    # Fix for 'nn' is not defined error in loss calculation
+        if current_step % 50_000 < max_steps:
+            torch.save(policy.state_dict(), "ppo_moonlander_checkpoint.pth")
+    torch.save(policy.state_dict(), "ppo_moonlander_final.pth")
+if __name__ == "__main__":
     train()
-   

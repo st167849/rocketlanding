@@ -15,7 +15,7 @@ def watch():
     
     # LOAD THE WEIGHTS (Change this filename to your latest .pth file)
     try:
-        policy.load_state_dict(torch.load("/root/projects/ppo_rocket_1000.pth", map_location=device))
+        policy.load_state_dict(torch.load("/root/projects/ppo_rocket_checkpoi.pth", map_location=device))
         print("Model loaded!")
     except:
         print("No model found. Flying with random weights.")
@@ -29,7 +29,7 @@ def watch():
             # For watching, we use the MEAN action (deterministic), not sampling
             # But our current get_action_and_value samples. 
             # For simplicity, let's just sample. It works fine.
-            action, _, _, _ = policy.get_action_and_value(state_tensor)
+            action, log_prob, _, value, raw_act = policy.get_action_and_value(state_tensor)
             
         action = action.cpu().numpy().flatten()
         state, reward, terminated, truncated, _ = env.step(action)

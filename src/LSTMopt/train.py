@@ -39,9 +39,9 @@ def train():
     MASK_INDICES = [0, 1, 4, 6, 7] # x, y, angle, leg1, leg2
     ENV_NAME = "LunarLanderContinuous-v3"
     
-    NUM_ENVS = 64         
+    NUM_ENVS = 256        
     NUM_STEPS = 256       
-    TOTAL_TIMESTEPS = 5_000_000
+    TOTAL_TIMESTEPS = 20_000_000
     
     # LSTM Training Params
     MINIBATCH_ENVS = 16
@@ -52,7 +52,7 @@ def train():
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
-    ENT_COEF = 0.01 
+    ENT_COEF = 0.005 
     VF_COEF = 0.75
     MAX_GRAD_NORM = 0.5
     BPTT_STEPS = 32

@@ -15,8 +15,7 @@ def make_env(env_id, mask_indices):
         # --- 1. Add Statistics Wrapper (CRITICAL FOR LOGGING) ---
         # This wrapper tracks the cumulative reward and adds it to info["episode"]["r"]
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        
-        # --- 2. Define New Observation Space ---
+        env = gym.wrappers.ClipAction(env)
         new_shape = (len(mask_indices),)
         new_observation_space = Box(
             low=-np.inf, 
@@ -42,20 +41,21 @@ def train():
     
     NUM_ENVS = 64         
     NUM_STEPS = 256       
-    TOTAL_TIMESTEPS = 10_000_000
+    TOTAL_TIMESTEPS = 5_000_000
     
     # LSTM Training Params
-    MINIBATCH_ENVS = 4
+    MINIBATCH_ENVS = 16
     K_EPOCHS = 4
     
     # PPO Params
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 3e-4
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
     CLIP_COEF = 0.2
     ENT_COEF = 0.01 
-    VF_COEF = 0.5
+    VF_COEF = 0.75
     MAX_GRAD_NORM = 0.5
+    BPTT_STEPS = 32
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Setup
@@ -75,12 +75,12 @@ def train():
     values_buffer = torch.zeros((NUM_STEPS, NUM_ENVS)).to(DEVICE)
 
     # LSTM States (Current running state)
-    h_rollout = torch.zeros(1, NUM_ENVS, 128).to(DEVICE)
-    c_rollout = torch.zeros(1, NUM_ENVS, 128).to(DEVICE)
+    h_rollout = torch.zeros(1, NUM_ENVS, 256).to(DEVICE)
+    c_rollout = torch.zeros(1, NUM_ENVS, 256).to(DEVICE)
 
-    # ### FIX 1: Add buffers to store the state at the START of the rollout ###
-    h_initial_buffer = torch.zeros(1, NUM_ENVS, 128).to(DEVICE)
-    c_initial_buffer = torch.zeros(1, NUM_ENVS, 128).to(DEVICE)
+    h_initial_buffer = torch.zeros(1, NUM_ENVS, 256).to(DEVICE)
+    c_initial_buffer = torch.zeros(1, NUM_ENVS, 256).to(DEVICE)
+
 
     global_step = 0
     start_time = time.time()
@@ -156,60 +156,81 @@ def train():
 
         # === 3. OPTIMIZATION ===
         policy.train()
-        
+
         env_indices = np.arange(NUM_ENVS)
-        
+
         for epoch in range(K_EPOCHS):
             np.random.shuffle(env_indices)
-            
+
             for start in range(0, NUM_ENVS, MINIBATCH_ENVS):
                 end = start + MINIBATCH_ENVS
                 mb_env_inds = env_indices[start:end]
-                
-                mb_obs = obs_buffer[:, mb_env_inds]
-                mb_actions = actions_buffer[:, mb_env_inds]
-                mb_logprobs = logprobs_buffer[:, mb_env_inds]
-                mb_advantages = advantages[:, mb_env_inds]
-                mb_returns = returns[:, mb_env_inds]
-                mb_values = values_buffer[:, mb_env_inds]
 
-                # ### FIX 3: Use the captured initial state, NOT Zeros ###
-                # This ensures the LSTM starts the training sequence with the 
-                # exact memory it had when it generated the data.
+                # Initial LSTM state for these environments
                 h0 = h_initial_buffer[:, mb_env_inds]
                 c0 = c_initial_buffer[:, mb_env_inds]
 
-                new_action, new_logprob, entropy, new_value, _ = policy.get_action_and_value(
-                    mb_obs, (h0, c0), action=mb_actions
-                )
+                # Truncated BPTT over time
+                for t_start in range(0, NUM_STEPS, BPTT_STEPS):
+                    t_end = t_start + BPTT_STEPS
 
-                b_logprobs = mb_logprobs.reshape(-1)
-                b_advantages = mb_advantages.reshape(-1)
-                b_returns = mb_returns.reshape(-1)
-                b_values = mb_values.reshape(-1)
-                
-                new_logprob = new_logprob.reshape(-1)
-                new_value = new_value.reshape(-1)
-                entropy = entropy.reshape(-1)
+                    mb_obs = obs_buffer[t_start:t_end, mb_env_inds]
+                    mb_actions = actions_buffer[t_start:t_end, mb_env_inds]
+                    mb_logprobs = logprobs_buffer[t_start:t_end, mb_env_inds]
+                    mb_advantages = advantages[t_start:t_end, mb_env_inds]
+                    mb_returns = returns[t_start:t_end, mb_env_inds]
+                    mb_values = values_buffer[t_start:t_end, mb_env_inds]
+                    mb_dones = dones_buffer[t_start:t_end, mb_env_inds]
 
-                logratio = new_logprob - b_logprobs
-                ratio = logratio.exp()
-                
-                pg_loss1 = -b_advantages * ratio
-                pg_loss2 = -b_advantages * torch.clamp(ratio, 1 - CLIP_COEF, 1 + CLIP_COEF)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    # Truncate gradient flow
+                    h0 = h0.detach()
+                    c0 = c0.detach()
 
-                v_loss_unclipped = (new_value - b_returns) ** 2
-                v_clipped = b_values + torch.clamp(new_value - b_values, -CLIP_COEF, CLIP_COEF)
-                v_loss_clipped = (v_clipped - b_returns) ** 2
-                v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    new_action, new_logprob, entropy, new_value, (h0, c0) = policy.get_action_and_value(
+                        mb_obs,
+                        (h0, c0),
+                        action=mb_actions
+                    )
 
-                loss = pg_loss - ENT_COEF * entropy.mean() + v_loss * VF_COEF
+                    # Flatten everything
+                    b_logprobs = mb_logprobs.reshape(-1)
+                    b_advantages = mb_advantages.reshape(-1)
+                    b_returns = mb_returns.reshape(-1)
+                    b_values = mb_values.reshape(-1)
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
-                optimizer.step()
+                    new_logprob = new_logprob.reshape(-1)
+                    new_value = new_value.reshape(-1)
+                    entropy = entropy.reshape(-1)
+
+                    # --- Advantage normalization (CRITICAL) ---
+                    b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+
+                    # --- PPO policy loss ---
+                    logratio = new_logprob - b_logprobs
+                    ratio = logratio.exp()
+
+                    pg_loss1 = -b_advantages * ratio
+                    pg_loss2 = -b_advantages * torch.clamp(
+                        ratio, 1 - CLIP_COEF, 1 + CLIP_COEF
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # --- Value loss ---
+                    v_loss_unclipped = (new_value - b_returns) ** 2
+                    v_clipped = b_values + torch.clamp(
+                        new_value - b_values, -CLIP_COEF, CLIP_COEF
+                    )
+                    v_loss_clipped = (v_clipped - b_returns) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                    # --- Total loss ---
+                    loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
+                    optimizer.step()
+
 
         if update % 10 == 0:
             avg_rew = np.mean(ep_reward_deque) if ep_reward_deque else 0

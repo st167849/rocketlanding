@@ -30,8 +30,8 @@ def evaluate(model_path="ppo_moonlander_lstm_opt.pth"):
         # --- LSTM INITIALIZATION ---
         # FIX 1: Your model defines LSTM size as hidden_size // 2
         # So if hidden_size=256, the LSTM state is 128.
-        h_state = torch.zeros(1, 1, 128).to(device)
-        c_state = torch.zeros(1, 1, 128).to(device)
+        h_state = torch.zeros(1, 1, 256).to(device)
+        c_state = torch.zeros(1, 1, 256).to(device)
         lstm_state = (h_state, c_state)
         
         terminated = False

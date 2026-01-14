@@ -11,22 +11,17 @@ class SymmetricActorCriticLSTM(nn.Module):
     def __init__(self, input_dim, action_dim, hidden_size=256):
         super().__init__()
         
-        # 1. Feature Extractor (Blind Input -> Embedding)
         self.embedding = nn.Sequential(
             layer_init(nn.Linear(input_dim, hidden_size)),
             nn.Tanh()
         )
         
-        # 2. Shared LSTM Memory
-        # The LSTM must do the heavy lifting of inferring velocity
-        self.lstm = nn.LSTM(hidden_size, hidden_size // 2, batch_first=False)
+        # LSTM hidden size = 256 (NOT 128)
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=False)
         
-        # 3. Actor Head
-        self.actor_head = layer_init(nn.Linear(hidden_size // 2, action_dim), std=0.01)
+        self.actor_head = layer_init(nn.Linear(hidden_size, action_dim), std=0.01)
         self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
-
-        # 4. Critic Head
-        self.critic_head = layer_init(nn.Linear(hidden_size // 2, 1), std=1)
+        self.critic_head = layer_init(nn.Linear(hidden_size, 1), std=1)
 
     def get_states(self, x, lstm_state, done):
         # x shape: [Seq_Len, Batch_Size, Input_Dim]

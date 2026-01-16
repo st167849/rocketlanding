@@ -231,11 +231,15 @@ def train():
                     nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
                     optimizer.step()
 
-
+        avg_rew = np.mean(ep_reward_deque) if ep_reward_deque else 0
         if update % 10 == 0:
-            avg_rew = np.mean(ep_reward_deque) if ep_reward_deque else 0
+            
             sps = int(global_step / (time.time() - start_time))
             print(f"Update: {update} | Step: {global_step} | SPS: {sps} | Mean Reward: {avg_rew:.2f}")
+        if avg_rew >= 250:
+            torch.save(policy.state_dict(), "ppo_moonlander_lstm_success.pth")
+            envs.close()
+            print(f"training successfull at Update {update} with reward {avg_rew}") 
 
     envs.close()
     torch.save(policy.state_dict(), "ppo_moonlander_lstm_opt.pth")

@@ -240,6 +240,7 @@ def train():
             torch.save(policy.state_dict(), "ppo_moonlander_lstm_success.pth")
             envs.close()
             print(f"training successfull at Update {update} with reward {avg_rew}") 
+            break
 
     envs.close()
     torch.save(policy.state_dict(), "ppo_moonlander_lstm_opt.pth")

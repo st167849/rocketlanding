@@ -5,7 +5,7 @@ from gymnasium.wrappers import FrameStackObservation, FlattenObservation
 
 # Adjust this import based on where your ActorCritic class is located
 # from rocketlanding.models import ActorCritic
-from models import ActorCritic 
+from rocketlanding_multiframe.models import ActorCritic 
 
 # --- Must define the same Wrapper class as training ---
 class NoVelocityWrapper(gym.ObservationWrapper):

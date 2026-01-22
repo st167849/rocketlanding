@@ -8,20 +8,20 @@ class ActorCritic(nn.Module):
         # Shared feature extractor (The "Base")
         # Forces the Actor and Critic to learn the underlying physics together
         self.base = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(state_dim, 128),
             nn.Tanh(),
-            nn.Linear(256, 256),
+            nn.Linear(128, 128),
             nn.Tanh()
         )
         
         # Actor head: Outputs the mean of the Gaussian distribution
-        self.actor_mean = nn.Linear(256, action_dim)
+        self.actor_mean = nn.Linear(128, action_dim)
         
         # Standard Deviation Parameter: Learned, but clamped later for stability
         self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
         
         # Critic head: Outputs the "State Value" (V)
-        self.critic = nn.Linear(256, 1)
+        self.critic = nn.Linear(128, 1)
 
     def get_value(self, state):
         return self.critic(self.base(state))

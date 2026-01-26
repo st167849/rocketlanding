@@ -3,13 +3,14 @@ import torch.optim as optim
 import torch.nn as nn
 import gymnasium as gym
 import numpy as np
+from collections import deque
 
 # UPDATED IMPORT: FrameStack is now FrameStackObservation
 from gymnasium.wrappers import FrameStackObservation, FlattenObservation
 
 # Import your custom modules
 from rocketlanding.models import ActorCritic
-from rocketlanding.memory import RolloutBuffer
+
 
 # --- Custom Wrapper to Remove Velocities ---
 class NoVelocityWrapper(gym.ObservationWrapper):
@@ -33,11 +34,11 @@ def train():
     max_steps = 2048
     batch_size = 64
     K_epochs = 10
-    lr = 1e-4
-    gamma = 0.999
+    lr = 2e-4
+    gamma = 0.99
     gae_lambda = 0.95
     eps_clip = 0.2
-    entropy_coef = 0.001
+    entropy_coef = 0.005
 
     # --- 1. Environment Setup ---
     env = gym.make(ENV_NAME)
@@ -45,8 +46,7 @@ def train():
     # Step A: Remove velocities
     env = NoVelocityWrapper(env)
     
-    # Step B: Stack frames (UPDATED CLASS AND ARGUMENT)
-    # Note: 'stack_size' instead of 'num_stack'
+    # Step B: Stack frames
     env = FrameStackObservation(env, stack_size=6)
     
     # Step C: Flatten to 1D vector
@@ -60,17 +60,20 @@ def train():
     current_step = 0
     print(f"Training started on {device}. Observation Space: {env.observation_space.shape[0]}")
 
+    # --- NEW: Episode Reward Tracking ---
+    # Stores the last 100 finished episode rewards
+    episode_rewards = deque(maxlen=100) 
+    current_ep_reward = 0.0
+
+    state, _ = env.reset()
+
     while current_step < total_timesteps:
         states, raw_actions, logprobs, rewards, dones, values = [], [], [], [], [], []
-        state, _ = env.reset()
         
         for _ in range(max_steps):
             current_step += 1
             
-            # Note: FrameStackObservation usually returns numpy arrays, 
-            # but keeping np.array(state) is safe and prevents errors.
-            state_np = np.array(state)
-            
+            state_np = np.array(state, dtype=np.float32)
             st_tensor = torch.FloatTensor(state_np).to(device).unsqueeze(0)
             
             with torch.no_grad():
@@ -78,6 +81,9 @@ def train():
 
             next_state, reward, term, trunc, _ = env.step(action.cpu().numpy().flatten())
             
+            # --- NEW: Accumulate episode reward ---
+            current_ep_reward += reward
+
             states.append(state_np)
             raw_actions.append(raw_act.cpu().numpy().flatten())
             logprobs.append(lp.cpu().item())
@@ -87,6 +93,9 @@ def train():
             
             state = next_state
             if term or trunc:
+                # --- NEW: Log finished flight and reset ---
+                episode_rewards.append(current_ep_reward)
+                current_ep_reward = 0.0
                 state, _ = env.reset()
 
         # --- GAE Advantage Calculation ---
@@ -94,9 +103,15 @@ def train():
         gae = 0
         
         with torch.no_grad():
-            last_state_np = np.array(state)
-            next_val = policy.get_value(torch.FloatTensor(last_state_np).to(device)).item()
-        
+            last_state_np = np.array(state, dtype=np.float32)
+            if dones[-1]:
+                next_val = 0.0
+            else:
+                # --- FIX 1: Added .unsqueeze(0) to match network input shape ---
+                next_val = policy.get_value(
+                    torch.FloatTensor(last_state_np).to(device).unsqueeze(0)
+                ).item()
+
         for i in reversed(range(len(rewards))):
             mask = 1.0 - dones[i]
             delta = rewards[i] + gamma * next_val * mask - values[i]
@@ -113,7 +128,9 @@ def train():
         
         adv_ts = (adv_ts - adv_ts.mean()) / (adv_ts.std() + 1e-8)
 
-        indices = np.arange(max_steps)
+        num_samples = len(states)
+        indices = np.arange(num_samples)
+
         for _ in range(K_epochs):
             np.random.shuffle(indices)
             for start in range(0, max_steps, batch_size):
@@ -126,7 +143,9 @@ def train():
                 surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * adv_ts[idx]
                 
                 actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = nn.MSELoss()(new_v, ret_ts[idx])
+                
+                # --- FIX 2: Added .squeeze() to new_v to prevent broadcasting errors ---
+                critic_loss = nn.MSELoss()(new_v.squeeze(), ret_ts[idx])
                 
                 loss = actor_loss + 0.5 * critic_loss - entropy_coef * ent.mean()
                 
@@ -136,12 +155,13 @@ def train():
                 optimizer.step()
 
         current_std = torch.exp(torch.clamp(policy.actor_logstd, -2, 1)).detach().cpu().numpy()
-        print(f"Step: {current_step} | Mean Reward: {np.mean(rewards):.2f} | Std: {current_std[0]}")
+        
+        # --- NEW: Print Mean Episode Reward instead of Mean Step Reward ---
+        mean_ep_reward = np.mean(episode_rewards) if len(episode_rewards) > 0 else 0.0
+        print(f"Step: {current_step} | Mean Flight Reward (last 100): {mean_ep_reward:.2f} | Std: {current_std[0]}")
 
-        #if current_step % 50_000 < max_steps:
-            #torch.save(policy.state_dict(), "ppo_moonlander_checkpoint.pth")
-            
     torch.save(policy.state_dict(), "ppo_moonlander_final.pth")
     print("model saved")
+
 if __name__ == "__main__":
     train()

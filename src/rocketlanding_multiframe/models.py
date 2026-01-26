@@ -38,7 +38,7 @@ class ActorCritic(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         
         if action is None:
-            raw_action = dist.sample()
+            raw_action = dist.rsample()
         else:
             raw_action = action 
 

@@ -38,7 +38,7 @@ def train():
     gamma = 0.99
     gae_lambda = 0.95
     eps_clip = 0.2
-    entropy_coef = 0.005
+    entropy_coef = 0.001
 
     # --- 1. Environment Setup ---
     env = gym.make(ENV_NAME)
@@ -47,7 +47,7 @@ def train():
     env = NoVelocityWrapper(env)
     
     # Step B: Stack frames
-    env = FrameStackObservation(env, stack_size=6)
+    env = FrameStackObservation(env, stack_size=8)
     
     # Step C: Flatten to 1D vector
     env = FlattenObservation(env)
@@ -133,26 +133,31 @@ def train():
 
         for _ in range(K_epochs):
             np.random.shuffle(indices)
-            for start in range(0, max_steps, batch_size):
-                idx = indices[start:start+batch_size]
-                
-                _, new_lp, ent, new_v, _ = policy.get_action_and_value(s_ts[idx], ra_ts[idx])
-                
+            for start in range(0, num_samples, batch_size):
+                idx = indices[start:start + batch_size]
+                if len(idx) == 0:
+                    continue
+
+                _, new_lp, ent, new_v, _ = policy.get_action_and_value(
+                    s_ts[idx], ra_ts[idx]
+                )
+
                 ratio = torch.exp(new_lp - lp_ts[idx])
                 surr1 = ratio * adv_ts[idx]
-                surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * adv_ts[idx]
-                
+                surr2 = torch.clamp(
+                    ratio, 1 - eps_clip, 1 + eps_clip
+                ) * adv_ts[idx]
+
                 actor_loss = -torch.min(surr1, surr2).mean()
-                
-                # --- FIX 2: Added .squeeze() to new_v to prevent broadcasting errors ---
-                critic_loss = nn.MSELoss()(new_v.squeeze(), ret_ts[idx])
-                
+                critic_loss = nn.MSELoss()(new_v.squeeze(-1), ret_ts[idx])
+
                 loss = actor_loss + 0.5 * critic_loss - entropy_coef * ent.mean()
-                
+
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
                 optimizer.step()
+
 
         current_std = torch.exp(torch.clamp(policy.actor_logstd, -2, 1)).detach().cpu().numpy()
         
